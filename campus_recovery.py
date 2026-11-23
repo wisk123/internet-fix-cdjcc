@@ -495,6 +495,8 @@ def recover_once(allow_auth=True, on_auth_attempt=None):
 CHECK_INTERVAL = 30
 REJECTION_RETRY_DELAY = 20
 MAX_AUTH_REJECTIONS = 11  # Initial submission plus ten retries.
+AUTH_COOLDOWN_SECONDS = 600
+AUTH_RECOVERY_ATTEMPTS = 5
 
 
 def credentials_revision():
@@ -504,19 +506,30 @@ def credentials_revision():
         return None
 
 
-def authentication_paused():
+@dataclass(frozen=True)
+class AuthenticationCooldown:
+    retry_after: float
+    attempts_remaining: int
+
+
+def read_authentication_cooldown(revision):
     try:
         pause = json.loads((DATA / 'authentication-paused.json').read_text(encoding='utf-8'))
-    except FileNotFoundError:
-        return False
-    except ValueError:
-        return True
-    if isinstance(pause, dict):
-        if pause.get('reason') == 'credentials_rejected':
-            return False  # Older builds paused after the first rejection.
-        if pause.get('reason') == 'repeated_credentials_rejected' and 'credentials_revision' in pause:
-            return pause['credentials_revision'] == credentials_revision()
-    return True
+        if (pause['reason'] != 'repeated_credentials_rejected'
+                or pause['credentials_revision'] != revision):
+            return None
+        if 'retry_after' not in pause:
+            # The previous version saved a local timestamp and paused indefinitely.
+            return AuthenticationCooldown(datetime.fromisoformat(pause['paused_at']).timestamp()
+                                          + AUTH_COOLDOWN_SECONDS, 0)
+        return AuthenticationCooldown(float(pause['retry_after']), int(pause['attempts_remaining']))
+    except (FileNotFoundError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def authentication_paused():
+    cooldown = read_authentication_cooldown(credentials_revision())
+    return cooldown is not None and time.time() < cooldown.retry_after
 
 
 @dataclass
@@ -525,16 +538,43 @@ class AuthenticationRetry:
     next_attempt: float = 0.0
     rejections: int = 0
     revision: int | None = None
+    cooldown: AuthenticationCooldown | None = None
+    final_recovery_attempt: bool = False
 
     def allowed(self):
         revision = credentials_revision()
         if self.revision != revision:
             self.reset()
             self.revision = revision
-        return (self.rejections < MAX_AUTH_REJECTIONS and not authentication_paused()
-                and time.monotonic() >= self.next_attempt)
+        self.cooldown = read_authentication_cooldown(revision)
+        return (time.monotonic() >= self.next_attempt
+                and (self.cooldown is None or time.time() >= self.cooldown.retry_after))
+
+    def save_cooldown(self, remaining, retry_after):
+        write_json(DATA / 'authentication-paused.json', {
+            'reason': 'repeated_credentials_rejected',
+            'credentials_revision': self.revision,
+            'attempts_remaining': remaining,
+            'retry_after': retry_after,
+        })
+        self.cooldown = AuthenticationCooldown(retry_after, remaining)
+
+    def start_cooldown(self):
+        self.save_cooldown(0, time.time() + AUTH_COOLDOWN_SECONDS)
+        LOG.warning('AUTH_COOLDOWN_STARTED: pausing automatic submissions for %s seconds.', AUTH_COOLDOWN_SECONDS)
 
     def record_attempt(self):
+        if self.revision != credentials_revision() or self.cooldown != read_authentication_cooldown(self.revision):
+            raise CampusError('Authentication state changed before submission; checking again on the next cycle.')
+        if self.cooldown is not None:
+            remaining = (self.cooldown.attempts_remaining or AUTH_RECOVERY_ATTEMPTS) - 1
+            # Reserve the slot before submitting so restarting cannot replenish it.
+            if remaining == 0:
+                self.start_cooldown()
+                self.final_recovery_attempt = True
+            else:
+                self.save_cooldown(remaining, 0)
+            LOG.info('AUTH_RECOVERY_ATTEMPT: %s more submissions in this round.', remaining)
         self.attempts += 1
         delay = min(60 * (2 ** min(self.attempts - 1, 3)), 300)
         self.next_attempt = time.monotonic() + delay
@@ -543,21 +583,23 @@ class AuthenticationRetry:
     def record_rejection(self):
         if self.revision != credentials_revision():
             return
-        self.rejections += 1
         self.attempts = 0
         self.next_attempt = time.monotonic() + REJECTION_RETRY_DELAY
+        if self.cooldown is not None:
+            return
+        self.rejections += 1
         if self.rejections < MAX_AUTH_REJECTIONS:
             LOG.info('AUTH_REJECTION_RETRY: ret_code=1; rejections=%s/%s; retry in at least %s seconds.',
                      self.rejections, MAX_AUTH_REJECTIONS, REJECTION_RETRY_DELAY)
             return
-        LOG.warning('MONITOR_AUTH_PAUSED: ret_code=1; rejections=%s/%s; connectivity checks continue.',
-                    self.rejections, MAX_AUTH_REJECTIONS)
-        write_json(DATA / 'authentication-paused.json', {
-            'reason': 'repeated_credentials_rejected',
-            'paused_at': datetime.now().isoformat(),
-            'credentials_revision': self.revision,
-            'rejections': self.rejections,
-        })
+        LOG.warning('MONITOR_AUTH_PAUSED: ret_code=1; rejections=%s/%s.', self.rejections, MAX_AUTH_REJECTIONS)
+        self.start_cooldown()
+
+    def finish_attempt(self):
+        if self.final_recovery_attempt:
+            self.final_recovery_attempt = False
+            if read_authentication_cooldown(credentials_revision()) == self.cooldown:
+                self.save_cooldown(0, time.time() + AUTH_COOLDOWN_SECONDS)
 
     def reset_backoff(self):
         self.attempts = 0
@@ -566,6 +608,7 @@ class AuthenticationRetry:
     def reset(self):
         self.reset_backoff()
         self.rejections = 0
+        self.cooldown = None
 
 
 def monitor_cycle(retry):
@@ -582,10 +625,16 @@ def monitor_cycle(retry):
     # A short glitch should not result in an authentication submission.
     if connectivity()[0] != 'online':
         time.sleep(10)
-    result = recover_once(allow_auth=retry.allowed(), on_auth_attempt=retry.record_attempt)
+    try:
+        result = recover_once(allow_auth=retry.allowed(), on_auth_attempt=retry.record_attempt)
+    finally:
+        retry.finish_attempt()
     if result == 'rejected':
         retry.record_rejection()
     elif result in ('online', 'authenticated'):
+        if retry.cooldown is not None and read_authentication_cooldown(credentials_revision()) == retry.cooldown:
+            (DATA / 'authentication-paused.json').unlink(missing_ok=True)
+            LOG.info('AUTH_COOLDOWN_CLEARED: connectivity restored.')
         retry.reset()
     return result
 
@@ -629,8 +678,9 @@ def watch():
                 kernel.CloseHandle(lock)
             LOG.info('A monitor is already running; exiting.')
             return
-    LOG.info('MONITOR_STARTED: check_interval=%ss; authentication_retry=60/120/240/300s; rejection_retry=%ss; max_rejections=%s',
-             CHECK_INTERVAL, REJECTION_RETRY_DELAY, MAX_AUTH_REJECTIONS)
+    LOG.info('MONITOR_STARTED: check_interval=%ss; authentication_retry=60/120/240/300s; '
+             'rejection_retry=%ss; max_rejections=%s; cooldown=%ss; recovery_attempts=%s',
+             CHECK_INTERVAL, REJECTION_RETRY_DELAY, MAX_AUTH_REJECTIONS, AUTH_COOLDOWN_SECONDS, AUTH_RECOVERY_ATTEMPTS)
     try:
         monitor_loop()
     finally:
@@ -790,7 +840,7 @@ def show_app():
         return '\n'.join((
             f"当前网络　{net.get('profile') or '未连接'}",
             f"校园网账号　{'已保存' if saved else '未设置'}　　单次认证　{'已验证' if verified else '待验证'}",
-            f"后台恢复　{task_text}" + ('\n已暂停自动认证。多次认证被拒绝，请检查账号设置或在网页尝试。' if paused else ''),
+            f"后台恢复　{task_text}" + ('\n自动认证冷却中，到期后会重新尝试。' if paused else ''),
         ))
 
     def update_ui():
