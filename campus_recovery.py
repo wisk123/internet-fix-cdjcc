@@ -472,8 +472,7 @@ def recover_once(allow_auth=True, on_auth_attempt=None):
     result = parse_jsonp(reply.body)
     verdict, code = authentication_verdict(result)
     if verdict == 'credentials_rejected':
-        LOG.error('AUTH_CREDENTIALS_REJECTED: ret_code=1; automatic submissions paused, monitoring continues.')
-        write_json(DATA / 'authentication-paused.json', {'reason': 'credentials_rejected', 'paused_at': datetime.now().isoformat()})
+        LOG.warning('AUTH_CREDENTIALS_REJECTED: ret_code=1.')
         return 'rejected'
     if verdict == 'retry':
         LOG.warning('AUTH_RETRYABLE: ret_code=%s; waiting before another submission; monitoring continues.', code)
@@ -494,25 +493,79 @@ def recover_once(allow_auth=True, on_auth_attempt=None):
 
 
 CHECK_INTERVAL = 30
+REJECTION_RETRY_DELAY = 20
+MAX_AUTH_REJECTIONS = 11  # Initial submission plus ten retries.
+
+
+def credentials_revision():
+    try:
+        return (DATA / 'credentials.json').stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+def authentication_paused():
+    try:
+        pause = json.loads((DATA / 'authentication-paused.json').read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return False
+    except ValueError:
+        return True
+    if isinstance(pause, dict):
+        if pause.get('reason') == 'credentials_rejected':
+            return False  # Older builds paused after the first rejection.
+        if pause.get('reason') == 'repeated_credentials_rejected' and 'credentials_revision' in pause:
+            return pause['credentials_revision'] == credentials_revision()
+    return True
 
 
 @dataclass
 class AuthenticationRetry:
     attempts: int = 0
     next_attempt: float = 0.0
+    rejections: int = 0
+    revision: int | None = None
 
     def allowed(self):
-        return not (DATA / 'authentication-paused.json').exists() and time.monotonic() >= self.next_attempt
+        revision = credentials_revision()
+        if self.revision != revision:
+            self.reset()
+            self.revision = revision
+        return (self.rejections < MAX_AUTH_REJECTIONS and not authentication_paused()
+                and time.monotonic() >= self.next_attempt)
 
     def record_attempt(self):
         self.attempts += 1
         delay = min(60 * (2 ** min(self.attempts - 1, 3)), 300)
         self.next_attempt = time.monotonic() + delay
-        LOG.info('AUTH_RETRY_SCHEDULED: at least %s seconds before another submission; checks remain every %s seconds.', delay, CHECK_INTERVAL)
+        LOG.debug('AUTH_NETWORK_BACKOFF: at least %s seconds after a temporary failure.', delay)
 
-    def reset(self):
+    def record_rejection(self):
+        if self.revision != credentials_revision():
+            return
+        self.rejections += 1
+        self.attempts = 0
+        self.next_attempt = time.monotonic() + REJECTION_RETRY_DELAY
+        if self.rejections < MAX_AUTH_REJECTIONS:
+            LOG.info('AUTH_REJECTION_RETRY: ret_code=1; rejections=%s/%s; retry in at least %s seconds.',
+                     self.rejections, MAX_AUTH_REJECTIONS, REJECTION_RETRY_DELAY)
+            return
+        LOG.warning('MONITOR_AUTH_PAUSED: ret_code=1; rejections=%s/%s; connectivity checks continue.',
+                    self.rejections, MAX_AUTH_REJECTIONS)
+        write_json(DATA / 'authentication-paused.json', {
+            'reason': 'repeated_credentials_rejected',
+            'paused_at': datetime.now().isoformat(),
+            'credentials_revision': self.revision,
+            'rejections': self.rejections,
+        })
+
+    def reset_backoff(self):
         self.attempts = 0
         self.next_attempt = 0.0
+
+    def reset(self):
+        self.reset_backoff()
+        self.rejections = 0
 
 
 def monitor_cycle(retry):
@@ -530,7 +583,9 @@ def monitor_cycle(retry):
     if connectivity()[0] != 'online':
         time.sleep(10)
     result = recover_once(allow_auth=retry.allowed(), on_auth_attempt=retry.record_attempt)
-    if result in ('online', 'authenticated'):
+    if result == 'rejected':
+        retry.record_rejection()
+    elif result in ('online', 'authenticated'):
         retry.reset()
     return result
 
@@ -545,15 +600,12 @@ def monitor_loop():
         if max(now - previous_wall, started - previous_tick) > 120:
             LOG.info('RESUME_DETECTED: waiting 30 seconds for Wi-Fi and campus session recovery.')
             time.sleep(30)
-            # Old timeout/cooldown does not describe the new network session.
-            # A persistent explicit password rejection still remains paused.
-            retry.reset()
+            # The wake delay has elapsed. Keep the rejection count across sleep.
+            retry.reset_backoff()
             started = time.monotonic()
         previous_wall, previous_tick = time.time(), started
         try:
-            result = monitor_cycle(retry)
-            if result == 'rejected':
-                LOG.warning('MONITOR_AUTH_PAUSED: update account settings or complete a successful single authentication test; connectivity checks continue.')
+            monitor_cycle(retry)
         except CampusError as exc:
             LOG.warning('MONITOR_RETRY: %s', exc)
         except (OSError, subprocess.SubprocessError):
@@ -577,7 +629,8 @@ def watch():
                 kernel.CloseHandle(lock)
             LOG.info('A monitor is already running; exiting.')
             return
-    LOG.info('MONITOR_STARTED: version=resume-v2; check_interval=30s; authentication_retry=60/120/240/300s')
+    LOG.info('MONITOR_STARTED: check_interval=%ss; authentication_retry=60/120/240/300s; rejection_retry=%ss; max_rejections=%s',
+             CHECK_INTERVAL, REJECTION_RETRY_DELAY, MAX_AUTH_REJECTIONS)
     try:
         monitor_loop()
     finally:
@@ -732,12 +785,12 @@ def show_app():
         task_text = {1: '已禁用', 2: '排队中', 3: '已启用', 4: '运行中'}.get(task.get('state'), '未启用')
         saved = (DATA / 'credentials.json').exists()
         verified = (DATA / 'verified.json').exists()
-        paused = (DATA / 'authentication-paused.json').exists()
+        paused = authentication_paused()
         net = network_state()
         return '\n'.join((
             f"当前网络　{net.get('profile') or '未连接'}",
             f"校园网账号　{'已保存' if saved else '未设置'}　　单次认证　{'已验证' if verified else '待验证'}",
-            f"后台恢复　{task_text}" + ('（已暂停提交密码）' if paused else ''),
+            f"后台恢复　{task_text}" + ('\n已暂停自动认证。多次认证被拒绝，请检查账号设置或在网页尝试。' if paused else ''),
         ))
 
     def update_ui():
@@ -795,7 +848,7 @@ def show_app():
             'not_campus': '请先连接支持的校园 Wi-Fi。',
             'uncertain': '暂未确认恢复上网，请查看日志。',
             'retry': '认证服务器暂未接受登录，请稍后再试。',
-            'rejected': '认证服务器拒绝账号或密码，请检查账号设置。',
+            'rejected': '本次认证被服务器拒绝，请稍后重试或检查账号设置。',
         }
         return descriptions[recover_once()]
 
@@ -866,7 +919,7 @@ def main():
             print('Credentials configured:', (DATA / 'credentials.json').exists())
             print('Authentication verified:', (DATA / 'verified.json').exists())
             print('Startup:', json.dumps(task_status()))
-            print('Authentication paused:', (DATA / 'authentication-paused.json').exists())
+            print('Authentication paused:', authentication_paused())
             print('Log:', DATA / 'recovery.log')
         return 0
     except CampusError as exc:
